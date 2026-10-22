@@ -11,3 +11,4 @@ uvicorn
 streamlit
 joblib
 pytest
+xgboost
