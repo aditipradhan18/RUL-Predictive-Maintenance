@@ -7,6 +7,8 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 
+import matplotlib.pyplot as plt
+
 st.set_page_config(
     page_title="QuantumFlix | Predictive Maintenance",
     page_icon="⚙️",
@@ -15,6 +17,7 @@ st.set_page_config(
 
 API_URL = "http://127.0.0.1:8000"
 DATA_PATH = "artifacts/sequence_data.npz"
+
 
 # --------------------------------------------------
 # Styling
@@ -46,6 +49,7 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
+
 # --------------------------------------------------
 # Data and API helpers
 # --------------------------------------------------
@@ -60,10 +64,12 @@ def check_api():
         request = urllib.request.Request(f"{API_URL}/health")
         with urllib.request.urlopen(request, timeout=3) as response:
             health = json.loads(response.read().decode())
+
         return (
             health.get("status") == "healthy"
             and health.get("model_loaded") is True
         )
+
     except (urllib.error.URLError, TimeoutError, ValueError):
         return False
 
@@ -92,12 +98,42 @@ def predict_rul(sequence):
 
 
 def classify_priority(rul):
-    # Illustrative demo thresholds, not validated maintenance limits.
+    # Illustrative thresholds for this demonstration only.
     if rul <= 20:
         return "High"
     if rul <= 50:
         return "Medium"
     return "Low"
+
+
+def predict_fleet(X_val, y_val, indices):
+    results = []
+
+    progress = st.progress(0, text="Analyzing simulated engines...")
+
+    for position, index in enumerate(indices, start=1):
+        predicted = predict_rul(X_val[index])
+        actual = float(y_val[index])
+
+        results.append(
+            {
+                "Engine": f"SIM-{index + 1:04d}",
+                "Sequence Index": int(index),
+                "Predicted RUL (cycles)": predicted,
+                "Actual RUL (cycles)": actual,
+                "Signed Error (cycles)": predicted - actual,
+                "Absolute Error (cycles)": abs(predicted - actual),
+                "Priority": classify_priority(predicted),
+            }
+        )
+
+        progress.progress(
+            position / len(indices),
+            text=f"Analyzed {position} of {len(indices)} engines",
+        )
+
+    progress.empty()
+    return pd.DataFrame(results)
 
 
 # --------------------------------------------------
@@ -107,6 +143,7 @@ st.markdown(
     '<div class="main-title">⚙️ QuantumFlix</div>',
     unsafe_allow_html=True,
 )
+
 st.markdown(
     '<div class="subtitle">Remaining Useful Life (RUL) '
     'Estimation & Predictive Maintenance</div>',
@@ -114,9 +151,8 @@ st.markdown(
 )
 
 st.info(
-    "Simulation demo: each engine below represents a selected "
-    "NASA C-MAPSS FD001 validation sequence. These are not real "
-    "aircraft engines or live telemetry."
+    "Simulation demo: each engine represents a validation sequence "
+    "from NASA C-MAPSS FD001. These are not real engines or live telemetry."
 )
 
 try:
@@ -127,6 +163,7 @@ except (FileNotFoundError, KeyError, OSError) as exc:
 
 api_healthy = check_api()
 
+
 # --------------------------------------------------
 # Overview metrics
 # --------------------------------------------------
@@ -134,14 +171,21 @@ col1, col2, col3, col4 = st.columns(4)
 
 with col1:
     st.metric("Validation Sequences", f"{len(X_val):,}")
+
 with col2:
     st.metric("Window Size", "50 cycles")
+
 with col3:
     st.metric("Input Features", "18")
+
 with col4:
-    st.metric("Prediction API", "Online" if api_healthy else "Offline")
+    st.metric(
+        "Prediction API",
+        "Online" if api_healthy else "Offline",
+    )
 
 st.divider()
+
 
 # --------------------------------------------------
 # Simulated fleet overview
@@ -149,121 +193,219 @@ st.divider()
 st.subheader("Fleet Overview")
 
 st.caption(
-    "Choose a small set of validation sequences to simulate a fleet. "
-    "Predictions are calculated through the existing FastAPI endpoint."
+    "Select a small sample of validation sequences and analyze them "
+    "using the trained LSTM model through FastAPI."
 )
 
 max_fleet_size = min(20, len(X_val))
+
 fleet_size = st.slider(
     "Number of simulated engines",
-    min_value=3 if max_fleet_size >= 3 else 1,
+    min_value=min(3, max_fleet_size),
     max_value=max_fleet_size,
     value=min(5, max_fleet_size),
 )
 
-# Deterministic selection spread across the validation dataset.
 fleet_indices = np.linspace(
     0, len(X_val) - 1, num=fleet_size, dtype=int
 )
 
-if "fleet_predictions" not in st.session_state:
-    st.session_state.fleet_predictions = {}
+if "fleet_results" not in st.session_state:
+    st.session_state.fleet_results = None
 
-if st.button("Analyze Fleet", type="primary", disabled=not api_healthy):
-    results = []
-    progress = st.progress(0, text="Analyzing simulated engines...")
-
-    for position, index in enumerate(fleet_indices, start=1):
-        try:
-            predicted = predict_rul(X_val[index])
-            results.append(
-                {
-                    "Engine": f"SIM-{index + 1:04d}",
-                    "Sequence Index": int(index),
-                    "Predicted RUL (cycles)": round(predicted, 2),
-                    "Actual RUL (cycles)": round(float(y_val[index]), 2),
-                    "Absolute Error (cycles)": round(
-                        abs(predicted - float(y_val[index])), 2
-                    ),
-                    "Priority": classify_priority(predicted),
-                }
+if st.button(
+    "Analyze Fleet",
+    type="primary",
+    disabled=not api_healthy,
+):
+    try:
+        with st.spinner("Generating fleet predictions..."):
+            st.session_state.fleet_results = predict_fleet(
+                X_val, y_val, fleet_indices
             )
-        except (
-            urllib.error.URLError,
-            TimeoutError,
-            ValueError,
-            KeyError,
-        ) as exc:
-            progress.empty()
-            st.error(f"Could not analyze sequence {index + 1}: {exc}")
-            st.stop()
+    except (
+        urllib.error.URLError,
+        TimeoutError,
+        ValueError,
+        KeyError,
+    ) as exc:
+        st.error(f"Fleet analysis failed: {exc}")
 
-        progress.progress(
-            position / fleet_size,
-            text=f"Analyzed {position} of {fleet_size} engines",
+fleet_df = st.session_state.fleet_results
+
+if fleet_df is not None and not fleet_df.empty:
+    # Recompute if the user changes fleet size.
+    expected_indices = set(map(int, fleet_indices))
+    existing_indices = set(fleet_df["Sequence Index"].astype(int))
+
+    if expected_indices != existing_indices:
+        st.info("Fleet size changed. Click Analyze Fleet to refresh predictions.")
+    else:
+        fleet_df = fleet_df.sort_values(
+            "Predicted RUL (cycles)"
+        ).reset_index(drop=True)
+
+        high_count = int((fleet_df["Priority"] == "High").sum())
+        medium_count = int((fleet_df["Priority"] == "Medium").sum())
+        low_count = int((fleet_df["Priority"] == "Low").sum())
+
+        m1, m2, m3, m4 = st.columns(4)
+
+        m1.metric("Analyzed Engines", len(fleet_df))
+        m2.metric("High Priority", high_count)
+        m3.metric("Medium Priority", medium_count)
+        m4.metric("Low Priority", low_count)
+
+        st.markdown("#### Engines ranked by predicted RUL")
+
+        display_columns = [
+            "Engine",
+            "Predicted RUL (cycles)",
+            "Actual RUL (cycles)",
+            "Absolute Error (cycles)",
+            "Priority",
+        ]
+
+        st.dataframe(
+            fleet_df[display_columns].round(2),
+            use_container_width=True,
+            hide_index=True,
         )
 
-    progress.empty()
-    st.session_state.fleet_predictions = {
-        row["Sequence Index"]: row for row in results
-    }
+        most_urgent = fleet_df.iloc[0]
 
-fleet_results = [
-    st.session_state.fleet_predictions[index]
-    for index in fleet_indices
-    if index in st.session_state.fleet_predictions
-]
+        st.warning(
+            f"Lowest predicted RUL: {most_urgent['Engine']} — "
+            f"{most_urgent['Predicted RUL (cycles)']:.2f} cycles. "
+            "This is a model-based demonstration ranking, not an "
+            "operational maintenance instruction."
+        )
 
-if fleet_results:
-    fleet_df = pd.DataFrame(fleet_results)
-    fleet_df = fleet_df.sort_values("Predicted RUL (cycles)")
+elif not api_healthy:
+    st.warning(
+        "The prediction API is offline. Start it in another terminal "
+        "with: `uvicorn src.api.main:app --reload`"
+    )
 
-    high_count = int((fleet_df["Priority"] == "High").sum())
-    medium_count = int((fleet_df["Priority"] == "Medium").sum())
-    low_count = int((fleet_df["Priority"] == "Low").sum())
+else:
+    st.info("Click Analyze Fleet to generate predictions.")
 
-    m1, m2, m3, m4 = st.columns(4)
-    m1.metric("Analyzed Engines", len(fleet_df))
-    m2.metric("High Priority", high_count)
-    m3.metric("Medium Priority", medium_count)
-    m4.metric("Low Priority", low_count)
+st.caption(
+    "Priority thresholds are illustrative and are not validated "
+    "aircraft maintenance limits."
+)
 
-    st.markdown("#### Engines ranked by predicted RUL")
+st.divider()
+
+
+# --------------------------------------------------
+# Prediction error analysis
+# --------------------------------------------------
+st.subheader("Prediction Error Analysis")
+
+st.caption(
+    "Charts below use the fleet predictions generated above. "
+    "They update when you analyze a new fleet."
+)
+
+if fleet_df is not None and not fleet_df.empty:
+    fleet_plot_df = fleet_df.copy()
+
+    mae = fleet_plot_df["Absolute Error (cycles)"].mean()
+    rmse = np.sqrt(
+        np.mean(fleet_plot_df["Signed Error (cycles)"] ** 2)
+    )
+    mean_error = fleet_plot_df["Signed Error (cycles)"].mean()
+
+    e1, e2, e3 = st.columns(3)
+
+    e1.metric("Fleet MAE", f"{mae:.2f} cycles")
+    e2.metric("Fleet RMSE", f"{rmse:.2f} cycles")
+    e3.metric("Mean Signed Error", f"{mean_error:+.2f} cycles")
+
+    chart_left, chart_right = st.columns(2)
+
+    # Predicted versus actual RUL
+    with chart_left:
+        st.markdown("#### Predicted vs. Actual RUL")
+
+        fig, ax = plt.subplots(figsize=(7, 5))
+
+        actual = fleet_plot_df["Actual RUL (cycles)"]
+        predicted = fleet_plot_df["Predicted RUL (cycles)"]
+
+        ax.scatter(actual, predicted)
+
+        lower = min(actual.min(), predicted.min(), 0)
+        upper = max(actual.max(), predicted.max(), 1)
+
+        ax.plot(
+            [lower, upper],
+            [lower, upper],
+            linestyle="--",
+        )
+
+        ax.set_xlabel("Actual RUL (cycles)")
+        ax.set_ylabel("Predicted RUL (cycles)")
+        ax.set_title("Predictions vs. Ground Truth")
+        ax.grid(True, alpha=0.25)
+
+        st.pyplot(fig)
+        plt.close(fig)
+
+    # Distribution of absolute prediction errors
+    with chart_right:
+        st.markdown("#### Absolute Error Distribution")
+
+        fig, ax = plt.subplots(figsize=(7, 5))
+
+        ax.hist(
+            fleet_plot_df["Absolute Error (cycles)"],
+            bins=min(10, max(3, len(fleet_plot_df))),
+        )
+
+        ax.set_xlabel("Absolute Error (cycles)")
+        ax.set_ylabel("Number of Engines")
+        ax.set_title("How Large Are the Errors?")
+        ax.grid(True, axis="y", alpha=0.25)
+
+        st.pyplot(fig)
+        plt.close(fig)
+
+    st.markdown("#### Largest Prediction Errors")
+
+    largest_errors = fleet_plot_df.sort_values(
+        "Absolute Error (cycles)",
+        ascending=False,
+    )
+
     st.dataframe(
-        fleet_df[
+        largest_errors[
             [
                 "Engine",
-                "Predicted RUL (cycles)",
                 "Actual RUL (cycles)",
+                "Predicted RUL (cycles)",
+                "Signed Error (cycles)",
                 "Absolute Error (cycles)",
-                "Priority",
             ]
-        ],
+        ].round(2),
         use_container_width=True,
         hide_index=True,
     )
 
-    most_urgent = fleet_df.iloc[0]
-    st.warning(
-        f"Lowest predicted RUL: {most_urgent['Engine']} — "
-        f"{most_urgent['Predicted RUL (cycles)']:.2f} cycles. "
-        "This is a model-based demo ranking, not an operational "
-        "maintenance instruction."
+    st.caption(
+        "Fleet metrics describe only this selected sample. They are not "
+        "the model's full validation metrics."
     )
-elif not api_healthy:
-    st.warning(
-        "The API is offline. Start it in another terminal with: "
-        "`uvicorn src.api.main:app --reload`"
-    )
-else:
-    st.info("Click **Analyze Fleet** to generate fleet predictions.")
 
-st.caption(
-    "Priority thresholds are illustrative and must not be used for "
-    "real aircraft maintenance decisions."
-)
+else:
+    st.info(
+        "Analyze a fleet first to generate predictions and display "
+        "prediction error charts."
+    )
 
 st.divider()
+
 
 # --------------------------------------------------
 # Individual sequence prediction
@@ -279,6 +421,7 @@ engine_index = st.selectbox(
 )
 
 sequence = X_val[engine_index]
+
 left, right = st.columns(2)
 
 with left:
@@ -293,6 +436,7 @@ with right:
 
     if not api_healthy:
         st.warning("Prediction API is offline.")
+
     elif st.button("Predict Remaining Useful Life"):
         try:
             predicted_rul = predict_rul(sequence)
@@ -303,13 +447,16 @@ with right:
                 f"{predicted_rul:.2f} cycles",
                 delta=f"{predicted_rul - actual_rul:+.2f} vs actual",
             )
+
             st.metric("Actual RUL", f"{actual_rul:.2f} cycles")
+
             st.metric(
                 "Absolute Error",
                 f"{abs(predicted_rul - actual_rul):.2f} cycles",
             )
 
             priority = classify_priority(predicted_rul)
+
             if priority == "High":
                 st.error("High demo maintenance priority")
             elif priority == "Medium":
@@ -326,6 +473,7 @@ with right:
             st.error(f"Prediction request failed: {exc}")
 
 st.divider()
+
 st.caption(
     "QuantumFlix demo · NASA C-MAPSS FD001 · "
     "PyTorch LSTM · FastAPI · Streamlit"
