@@ -6,8 +6,8 @@ import urllib.request
 import numpy as np
 import pandas as pd
 import streamlit as st
-
 import matplotlib.pyplot as plt
+
 
 st.set_page_config(
     page_title="QuantumFlix | Predictive Maintenance",
@@ -17,6 +17,27 @@ st.set_page_config(
 
 API_URL = "http://127.0.0.1:8000"
 DATA_PATH = "artifacts/sequence_data.npz"
+
+FEATURE_COLUMNS = [
+    "cycle",
+    "op_setting_1",
+    "op_setting_2",
+    "op_setting_3",
+    "sensor_2",
+    "sensor_3",
+    "sensor_4",
+    "sensor_7",
+    "sensor_8",
+    "sensor_9",
+    "sensor_11",
+    "sensor_12",
+    "sensor_13",
+    "sensor_14",
+    "sensor_15",
+    "sensor_17",
+    "sensor_20",
+    "sensor_21",
+]
 
 
 # --------------------------------------------------
@@ -29,17 +50,20 @@ st.markdown(
         background-color: #0b1020;
         color: #f1f5f9;
     }
+
     [data-testid="stMetric"] {
         background-color: #151d32;
         border: 1px solid #293550;
         padding: 18px;
         border-radius: 12px;
     }
+
     .main-title {
         font-size: 2.2rem;
         font-weight: 750;
         color: #f8fafc;
     }
+
     .subtitle {
         color: #a5b4cc;
         margin-bottom: 1.5rem;
@@ -61,7 +85,10 @@ def load_validation_data():
 
 def check_api():
     try:
-        request = urllib.request.Request(f"{API_URL}/health")
+        request = urllib.request.Request(
+            f"{API_URL}/health"
+        )
+
         with urllib.request.urlopen(request, timeout=3) as response:
             health = json.loads(response.read().decode())
 
@@ -70,7 +97,11 @@ def check_api():
             and health.get("model_loaded") is True
         )
 
-    except (urllib.error.URLError, TimeoutError, ValueError):
+    except (
+        urllib.error.URLError,
+        TimeoutError,
+        ValueError,
+    ):
         return False
 
 
@@ -92,7 +123,9 @@ def predict_rul(sequence):
     prediction = float(result["predicted_rul_cycles"])
 
     if not np.isfinite(prediction):
-        raise ValueError("The model returned a non-finite prediction.")
+        raise ValueError(
+            "The model returned a non-finite prediction."
+        )
 
     return max(0.0, prediction)
 
@@ -101,38 +134,122 @@ def classify_priority(rul):
     # Illustrative thresholds for this demonstration only.
     if rul <= 20:
         return "High"
+
     if rul <= 50:
         return "Medium"
+
     return "Low"
 
 
-def predict_fleet(X_val, y_val, indices):
-    results = []
+# --------------------------------------------------
+# Feature explainability
+# --------------------------------------------------
+def explain_sequence_features(sequence, X_val):
+    """
+    Measure local prediction sensitivity by replacing one feature
+    at a time with its median across the validation input data.
 
-    progress = st.progress(0, text="Analyzing simulated engines...")
+    The original cycle trajectory is preserved because cycle is
+    unscaled. This is sensitivity analysis, not causal attribution.
+    """
+    sequence = np.asarray(sequence, dtype=np.float32)
 
-    for position, index in enumerate(indices, start=1):
-        predicted = predict_rul(X_val[index])
-        actual = float(y_val[index])
+    expected_shape = (50, len(FEATURE_COLUMNS))
 
-        results.append(
+    if sequence.shape != expected_shape:
+        raise ValueError(
+            f"Expected sequence shape {expected_shape}, "
+            f"received {sequence.shape}."
+        )
+
+    if not np.isfinite(sequence).all():
+        raise ValueError("Sequence contains non-finite values.")
+
+    feature_baseline = np.median(
+        X_val.reshape(-1, X_val.shape[-1]),
+        axis=0,
+    )
+
+    original_prediction = predict_rul(sequence)
+    rows = []
+
+    for index, feature_name in enumerate(FEATURE_COLUMNS):
+        # Cycle is unscaled and has a meaningful time progression.
+        if feature_name == "cycle":
+            continue
+
+        occluded = sequence.copy()
+        occluded[:, index] = feature_baseline[index]
+
+        occluded_prediction = predict_rul(occluded)
+
+        signed_change = (
+            occluded_prediction - original_prediction
+        )
+
+        rows.append(
             {
-                "Engine": f"SIM-{index + 1:04d}",
-                "Sequence Index": int(index),
-                "Predicted RUL (cycles)": predicted,
-                "Actual RUL (cycles)": actual,
-                "Signed Error (cycles)": predicted - actual,
-                "Absolute Error (cycles)": abs(predicted - actual),
-                "Priority": classify_priority(predicted),
+                "Feature": feature_name,
+                "Original prediction (cycles)": original_prediction,
+                "Prediction after replacement (cycles)": (
+                    occluded_prediction
+                ),
+                "Signed change (cycles)": signed_change,
+                "Absolute change (cycles)": abs(signed_change),
             }
         )
 
-        progress.progress(
-            position / len(indices),
-            text=f"Analyzed {position} of {len(indices)} engines",
-        )
+    results = pd.DataFrame(rows)
 
-    progress.empty()
+    results = results.sort_values(
+        "Absolute change (cycles)",
+        ascending=False,
+    ).reset_index(drop=True)
+
+    return results, original_prediction
+
+
+# --------------------------------------------------
+# Fleet prediction
+# --------------------------------------------------
+def predict_fleet(X_val, y_val, indices):
+    results = []
+
+    progress = st.progress(
+        0,
+        text="Analyzing simulated engines...",
+    )
+
+    try:
+        for position, index in enumerate(indices, start=1):
+            predicted = predict_rul(X_val[index])
+            actual = float(y_val[index])
+
+            results.append(
+                {
+                    "Engine": f"SIM-{index + 1:04d}",
+                    "Sequence Index": int(index),
+                    "Predicted RUL (cycles)": predicted,
+                    "Actual RUL (cycles)": actual,
+                    "Signed Error (cycles)": predicted - actual,
+                    "Absolute Error (cycles)": abs(
+                        predicted - actual
+                    ),
+                    "Priority": classify_priority(predicted),
+                }
+            )
+
+            progress.progress(
+                position / len(indices),
+                text=(
+                    f"Analyzed {position} of "
+                    f"{len(indices)} engines"
+                ),
+            )
+
+    finally:
+        progress.empty()
+
     return pd.DataFrame(results)
 
 
@@ -155,10 +272,19 @@ st.info(
     "from NASA C-MAPSS FD001. These are not real engines or live telemetry."
 )
 
+
+# --------------------------------------------------
+# Load data
+# --------------------------------------------------
 try:
     X_val, y_val = load_validation_data()
+
 except (FileNotFoundError, KeyError, OSError) as exc:
     st.error(f"Could not load validation data: {exc}")
+    st.stop()
+
+if len(X_val) == 0:
+    st.error("The validation dataset is empty.")
     st.stop()
 
 api_healthy = check_api()
@@ -170,7 +296,10 @@ api_healthy = check_api()
 col1, col2, col3, col4 = st.columns(4)
 
 with col1:
-    st.metric("Validation Sequences", f"{len(X_val):,}")
+    st.metric(
+        "Validation Sequences",
+        f"{len(X_val):,}",
+    )
 
 with col2:
     st.metric("Window Size", "50 cycles")
@@ -207,7 +336,10 @@ fleet_size = st.slider(
 )
 
 fleet_indices = np.linspace(
-    0, len(X_val) - 1, num=fleet_size, dtype=int
+    0,
+    len(X_val) - 1,
+    num=fleet_size,
+    dtype=int,
 )
 
 if "fleet_results" not in st.session_state:
@@ -221,8 +353,11 @@ if st.button(
     try:
         with st.spinner("Generating fleet predictions..."):
             st.session_state.fleet_results = predict_fleet(
-                X_val, y_val, fleet_indices
+                X_val,
+                y_val,
+                fleet_indices,
             )
+
     except (
         urllib.error.URLError,
         TimeoutError,
@@ -234,20 +369,31 @@ if st.button(
 fleet_df = st.session_state.fleet_results
 
 if fleet_df is not None and not fleet_df.empty:
-    # Recompute if the user changes fleet size.
     expected_indices = set(map(int, fleet_indices))
-    existing_indices = set(fleet_df["Sequence Index"].astype(int))
+    existing_indices = set(
+        fleet_df["Sequence Index"].astype(int)
+    )
 
     if expected_indices != existing_indices:
-        st.info("Fleet size changed. Click Analyze Fleet to refresh predictions.")
+        st.info(
+            "Fleet size changed. Click Analyze Fleet "
+            "to refresh predictions."
+        )
+
     else:
         fleet_df = fleet_df.sort_values(
             "Predicted RUL (cycles)"
         ).reset_index(drop=True)
 
-        high_count = int((fleet_df["Priority"] == "High").sum())
-        medium_count = int((fleet_df["Priority"] == "Medium").sum())
-        low_count = int((fleet_df["Priority"] == "Low").sum())
+        high_count = int(
+            (fleet_df["Priority"] == "High").sum()
+        )
+        medium_count = int(
+            (fleet_df["Priority"] == "Medium").sum()
+        )
+        low_count = int(
+            (fleet_df["Priority"] == "Low").sum()
+        )
 
         m1, m2, m3, m4 = st.columns(4)
 
@@ -311,21 +457,31 @@ st.caption(
 if fleet_df is not None and not fleet_df.empty:
     fleet_plot_df = fleet_df.copy()
 
-    mae = fleet_plot_df["Absolute Error (cycles)"].mean()
+    mae = fleet_plot_df[
+        "Absolute Error (cycles)"
+    ].mean()
+
     rmse = np.sqrt(
-        np.mean(fleet_plot_df["Signed Error (cycles)"] ** 2)
+        np.mean(
+            fleet_plot_df["Signed Error (cycles)"] ** 2
+        )
     )
-    mean_error = fleet_plot_df["Signed Error (cycles)"].mean()
+
+    mean_error = fleet_plot_df[
+        "Signed Error (cycles)"
+    ].mean()
 
     e1, e2, e3 = st.columns(3)
 
     e1.metric("Fleet MAE", f"{mae:.2f} cycles")
     e2.metric("Fleet RMSE", f"{rmse:.2f} cycles")
-    e3.metric("Mean Signed Error", f"{mean_error:+.2f} cycles")
+    e3.metric(
+        "Mean Signed Error",
+        f"{mean_error:+.2f} cycles",
+    )
 
     chart_left, chart_right = st.columns(2)
 
-    # Predicted versus actual RUL
     with chart_left:
         st.markdown("#### Predicted vs. Actual RUL")
 
@@ -353,7 +509,6 @@ if fleet_df is not None and not fleet_df.empty:
         st.pyplot(fig)
         plt.close(fig)
 
-    # Distribution of absolute prediction errors
     with chart_right:
         st.markdown("#### Absolute Error Distribution")
 
@@ -394,14 +549,14 @@ if fleet_df is not None and not fleet_df.empty:
     )
 
     st.caption(
-        "Fleet metrics describe only this selected sample. They are not "
-        "the model's full validation metrics."
+        "Fleet metrics describe only this selected sample. "
+        "They are not the model's full validation metrics."
     )
 
 else:
     st.info(
-        "Analyze a fleet first to generate predictions and display "
-        "prediction error charts."
+        "Analyze a fleet first to generate predictions "
+        "and display prediction error charts."
     )
 
 st.divider()
@@ -416,7 +571,8 @@ engine_index = st.selectbox(
     "Select a validation sequence",
     options=list(range(len(X_val))),
     format_func=lambda i: (
-        f"SIM-{i + 1:04d} — actual RUL: {y_val[i]:.0f} cycles"
+        f"SIM-{i + 1:04d} — actual RUL: "
+        f"{y_val[i]:.0f} cycles"
     ),
 )
 
@@ -445,10 +601,16 @@ with right:
             st.metric(
                 "Predicted RUL",
                 f"{predicted_rul:.2f} cycles",
-                delta=f"{predicted_rul - actual_rul:+.2f} vs actual",
+                delta=(
+                    f"{predicted_rul - actual_rul:+.2f} "
+                    "vs actual"
+                ),
             )
 
-            st.metric("Actual RUL", f"{actual_rul:.2f} cycles")
+            st.metric(
+                "Actual RUL",
+                f"{actual_rul:.2f} cycles",
+            )
 
             st.metric(
                 "Absolute Error",
@@ -471,6 +633,117 @@ with right:
             KeyError,
         ) as exc:
             st.error(f"Prediction request failed: {exc}")
+
+
+st.divider()
+
+
+# --------------------------------------------------
+# Feature explainability
+# --------------------------------------------------
+st.subheader("Feature Explainability")
+
+st.caption(
+    "Explore which input features most affect the selected sequence's "
+    "prediction. Each feature is replaced across the 50 time steps "
+    "with its validation-set median. The cycle trajectory is preserved. "
+    "This is local sensitivity analysis, not causal attribution."
+)
+
+if not api_healthy:
+    st.warning(
+        "Start the prediction API to run feature explainability."
+    )
+
+else:
+    if st.button("Explain Selected Prediction"):
+        try:
+            with st.spinner(
+                "Analyzing feature sensitivity. "
+                "This requires 18 API predictions..."
+            ):
+                explanation_df, explained_prediction = (
+                    explain_sequence_features(sequence, X_val)
+                )
+
+                st.session_state["feature_explanation"] = {
+                    "engine_index": int(engine_index),
+                    "prediction": explained_prediction,
+                    "results": explanation_df,
+                }
+
+        except (
+            urllib.error.URLError,
+            TimeoutError,
+            ValueError,
+            KeyError,
+        ) as exc:
+            st.error(
+                f"Feature explainability failed: {exc}"
+            )
+
+    explanation_state = st.session_state.get(
+        "feature_explanation"
+    )
+
+    if explanation_state is not None:
+        if explanation_state["engine_index"] != int(engine_index):
+            st.info(
+                "Click **Explain Selected Prediction** to analyze "
+                "the currently selected sequence."
+            )
+
+        else:
+            explanation_df = explanation_state["results"]
+
+            st.metric(
+                "Prediction Used for Analysis",
+                f"{explanation_state['prediction']:.2f} cycles",
+            )
+
+            st.markdown("#### Top 10 Sensitive Features")
+
+            chart_df = (
+                explanation_df
+                .head(10)
+                .sort_values("Absolute change (cycles)")
+            )
+
+            fig, ax = plt.subplots(figsize=(9, 5.5))
+
+            ax.barh(
+                chart_df["Feature"],
+                chart_df["Absolute change (cycles)"],
+            )
+
+            ax.set_xlabel(
+                "Absolute prediction change (cycles)"
+            )
+            ax.set_ylabel("Input feature")
+            ax.set_title(
+                "Top Features by Local Prediction Sensitivity"
+            )
+            ax.grid(True, axis="x", alpha=0.25)
+
+            fig.tight_layout()
+            st.pyplot(fig)
+            plt.close(fig)
+
+            st.markdown("#### Feature Sensitivity Details")
+
+            st.dataframe(
+                explanation_df.round(3),
+                use_container_width=True,
+                hide_index=True,
+            )
+
+            st.caption(
+                "Positive signed change means the prediction increased "
+                "after replacing that feature. Negative signed change "
+                "means it decreased. Results are specific to the selected "
+                "validation sequence and the chosen median baseline."
+            )
+
 
 st.divider()
 
