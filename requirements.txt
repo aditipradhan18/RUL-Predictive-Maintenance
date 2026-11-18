@@ -12,3 +12,4 @@ streamlit
 joblib
 pytest
 xgboost
+pydantic
